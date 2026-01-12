@@ -1,12 +1,15 @@
 // ============================================================================
 // File: src/app/decisions/page.tsx
-// Version: 20260112-12
+// Version: 20260112-12-fixed+deterministic+bulletproof
 // Project: Mercy Signal
 // Purpose:
 //   Render Production Decisions with deterministic ordering and optional explainability.
 // Notes:
 //   - Severity label is ALWAYS available (fallback derived from score when explain view is absent).
 //   - Trend/Confidence pills only render when usingExplain=true (because base view won’t have them).
+//   - Medium threshold = 80 (user chosen).
+//   - Sorting is fully deterministic (final tie-breaker on signal_id).
+//   - Bullet-proofing: ensure a deterministic, non-empty signal_id for stable keys + sorting.
 // ============================================================================
 
 import React from "react";
@@ -16,6 +19,10 @@ type ProductionStatus = "incident" | "investigate" | "watch" | "ok";
 type SeverityLabel = "High" | "Medium" | "Low" | "None";
 type TrendLabel = "worsening" | "stable" | "improving";
 type ConfidenceLabel = "high" | "medium" | "low";
+
+// Views
+const EXPLAIN_VIEW = "v_production_decisions_explain";
+const BASE_VIEW = "v_production_decisions";
 
 // ============================================================================
 // File: src/app/decisions/page.tsx
@@ -84,10 +91,10 @@ export default async function DecisionsPage() {
   let data: any[] = [];
   let usingExplain = false;
 
-  const r1 = await supabase.from("v_production_decisions_explain").select(selectWithExplain);
+  const r1 = await supabase.from(EXPLAIN_VIEW).select(selectWithExplain);
 
   if (r1.error) {
-    const r2 = await supabase.from("v_production_decisions").select(selectRequired);
+    const r2 = await supabase.from(BASE_VIEW).select(selectRequired);
     if (r2.error) {
       return (
         <main className="min-h-screen bg-slate-50">
@@ -115,15 +122,25 @@ export default async function DecisionsPage() {
   const sorted: NormalizedDecisionRow[] = [...rows].sort((a, b) => {
     const sr = statusRank(a.production_status) - statusRank(b.production_status);
     if (sr !== 0) return sr;
+
     if (a.prod_issues_24h !== b.prod_issues_24h) return b.prod_issues_24h - a.prod_issues_24h;
     if (a.prod_issues_7d !== b.prod_issues_7d) return b.prod_issues_7d - a.prod_issues_7d;
 
     const am = a.minutes_since_last_prod_issue;
     const bm = b.minutes_since_last_prod_issue;
-    if (am == null && bm == null) return 0;
+
+    if (am == null && bm == null) {
+      // final deterministic tie-breaker
+      return (a.signal_id || "").localeCompare(b.signal_id || "");
+    }
     if (am == null) return 1;
     if (bm == null) return -1;
-    return am - bm;
+
+    const recency = am - bm;
+    if (recency !== 0) return recency;
+
+    // final deterministic tie-breaker (even when same minutes)
+    return (a.signal_id || "").localeCompare(b.signal_id || "");
   });
 
   return (
@@ -175,7 +192,7 @@ export default async function DecisionsPage() {
                           {r.production_status}
                         </span>
 
-                        {/* Severity is ALWAYS shown (label is derived from score if explain view is absent) */}
+                        {/* Severity is ALWAYS shown (derived from score if missing) */}
                         <span
                           className={[
                             "inline-flex w-fit items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset",
@@ -229,9 +246,11 @@ export default async function DecisionsPage() {
                     <Td className="text-right tabular-nums">{r.prod_issues_24h}</Td>
                     <Td className="text-right tabular-nums">{r.prod_issues_7d}</Td>
                     <Td className="whitespace-nowrap">{fmtDateTime(r.last_prod_issue_at)}</Td>
-                    <Td className="whitespace-nowrap">{fmtRecency(r.minutes_since_last_prod_issue)}</Td>
+                    <Td className="whitespace-nowrap">
+                      {fmtRecency(r.minutes_since_last_prod_issue)}
+                    </Td>
 
-                    {/* Severity column: score + label ALWAYS (label derived if needed) */}
+                    {/* Severity column: score + label ALWAYS */}
                     <Td className="text-right tabular-nums">
                       <span className="font-medium">{r.severity_score_7d}</span>
                       <span className="ml-1 text-xs text-slate-500">({r.severity_label})</span>
@@ -289,6 +308,8 @@ function pillClasses(status: ProductionStatus): string {
       return "bg-blue-50 text-blue-700 ring-blue-200";
     case "ok":
       return "bg-emerald-50 text-emerald-700 ring-emerald-200";
+    default:
+      return "bg-slate-50 text-slate-700 ring-slate-200";
   }
 }
 
@@ -375,6 +396,17 @@ function shortId(id: string): string {
   return `${id.slice(0, 8)}…${id.slice(-6)}`;
 }
 
+// Deterministic, tiny hash (stable across runs) for fallback ids.
+// Not cryptographic—just prevents empty keys and preserves determinism.
+function tinyHash(input: string): string {
+  let h = 2166136261; // FNV-ish start
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
 // ============================================================================
 // File: src/app/decisions/page.tsx
 // Block: normalizeDecisionRow
@@ -428,12 +460,12 @@ function toStringOrNull(v: unknown): string | null {
 }
 
 function asSeverityLabel(v: unknown): SeverityLabel {
-  return v === "High" || v === "Medium" || v === "Low" ? v : "None";
+  return v === "High" || v === "Medium" || v === "Low" || v === "None" ? v : "None";
 }
 
 function deriveSeverityLabelFromScore(score: number): SeverityLabel {
   // Medium threshold chosen by user: 80
-  // High is intentionally higher to preserve 3-band meaning
+  // High threshold kept higher to preserve 3-band meaning (tune later if needed)
   if (score >= 200) return "High";
   if (score >= 80) return "Medium";
   if (score >= 1) return "Low";
@@ -453,12 +485,19 @@ function asConfidence(v: unknown): ConfidenceLabel | null {
 }
 
 function normalizeDecisionRow(row: any): NormalizedDecisionRow {
-  const signal_id =
+  const rawId =
     typeof row?.signal_id === "string" && row.signal_id.trim() ? row.signal_id.trim() : "";
 
+  // Bullet-proof: never allow an empty id (keys + sort rely on this).
+  // Deterministic fallback id derived from row content.
+  const signal_id = rawId || `missing:${tinyHash(JSON.stringify(row ?? {}))}`;
+
   const severity_score_7d = toIntOrZero(row?.severity_score_7d);
+
+  // If view provides a label, use it (High/Medium/Low/None). Otherwise derive from score.
   const rawLabel = asSeverityLabel(row?.severity_label);
-  const severity_label = rawLabel !== "None" ? rawLabel : deriveSeverityLabelFromScore(severity_score_7d);
+  const severity_label =
+    rawLabel !== "None" ? rawLabel : deriveSeverityLabelFromScore(severity_score_7d);
 
   return {
     signal_id,
