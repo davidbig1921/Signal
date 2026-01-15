@@ -1,23 +1,24 @@
--- ============================================================================
--- File: supabase/migrations/20260112161000_ms_v_production_decisions_explain.sql
--- Version: 20260112-01
--- Project: Mercy Signal
+-- =============================================================================
+-- Migration: ms_v_production_decisions_explain
 -- Purpose:
---   Provide explainability + severity labels for Production Decisions.
--- Notes:
---   - DROP+CREATE avoids Postgres CREATE OR REPLACE view column rename issues.
---   - Depends on: public.v_production_decisions
--- ============================================================================
-
-begin;
+--   Avoid duplicate column names by NOT selecting d.*
+--   (base view may already contain status_reason/action_hint/severity_label, etc.)
+-- =============================================================================
 
 drop view if exists public.v_production_decisions_explain;
 
 create view public.v_production_decisions_explain as
 select
-  d.*,
+  -- Core columns (stable contract)
+  d.signal_id,
+  d.prod_issues_24h,
+  d.prod_issues_7d,
+  d.last_prod_issue_at,
+  d.minutes_since_last_prod_issue,
+  d.severity_score_7d,
+  d.production_status,
 
-  -- Severity bins (deterministic, documented thresholds)
+  -- Severity bins (deterministic thresholds)
   case
     when d.severity_score_7d >= 80 then 3
     when d.severity_score_7d >= 40 then 2
@@ -57,5 +58,3 @@ select
   end as action_hint
 
 from public.v_production_decisions d;
-
-commit;

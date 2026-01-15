@@ -1,0 +1,9 @@
+-- =============================================================================
+-- Migration: ms_v_production_decisions_explain_tune_v2
+-- Status: NO-OP (intentionally disabled)
+-- Reason:
+--   Explain-view tuning is paused while we:
+--     1) eliminate duplicate migration timelines (_0000xx files),
+--     2) align explain view to code-based contracts (no prose),
+--     3) finalize status_reason_code -> text function (if needed).
+-- =============================================================================

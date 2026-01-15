@@ -4,7 +4,12 @@ begin;
 -- Production decisions per signal (SQL-driven decision engine)
 -- =========================================================
 
-create or replace view public.v_production_decisions as
+-- IMPORTANT:
+-- CREATE OR REPLACE VIEW cannot change column data types (e.g., bigint -> int).
+-- During db reset, drop + create is safe and avoids 42P16.
+drop view if exists public.v_production_decisions;
+
+create view public.v_production_decisions as
 with prod as (
   select
     e.signal_id,
@@ -52,7 +57,7 @@ select
   a.prod_issues_7d,
   a.last_prod_issue_at,
   case
-    when a.last_prod_issue_at is null then null
+    when a.last_prod_issue_at is null then null::numeric
     else extract(epoch from (now() - a.last_prod_issue_at)) / 60.0
   end as minutes_since_last_prod_issue,
   a.severity_score_7d,

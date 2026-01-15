@@ -1,22 +1,22 @@
--- ============================================================================
--- File: supabase/migrations/20260112173000_ms_v_production_decisions_explain_trend_conf.sql
--- Version: 20260112-01
--- Project: Mercy Signal
+-- =============================================================================
+-- Migration: ms_v_production_decisions_explain_trend_conf
 -- Purpose:
---   Add trend + confidence to v_production_decisions_explain (deterministic).
--- Notes:
---   - DROP+CREATE avoids view replace issues.
---   - Depends on: public.v_production_decisions
--- ============================================================================
-
-begin;
+--   Add trend + confidence to v_production_decisions_explain WITHOUT using d.*
+--   or b.* (prevents duplicate-column errors across iterations).
+-- =============================================================================
 
 drop view if exists public.v_production_decisions_explain;
 
 create view public.v_production_decisions_explain as
 with base as (
   select
-    d.*,
+    d.signal_id,
+    d.prod_issues_24h,
+    d.prod_issues_7d,
+    d.last_prod_issue_at,
+    d.minutes_since_last_prod_issue,
+    d.severity_score_7d,
+    d.production_status,
 
     case
       when coalesce(d.prod_issues_7d, 0) = 0 and coalesce(d.prod_issues_24h, 0) = 0 then 'stable'
@@ -25,11 +25,18 @@ with base as (
       when d.prod_issues_24h <= (d.prod_issues_7d / 7.0) * 0.5 then 'improving'
       else 'stable'
     end as trend_24h_vs_7d
-
   from public.v_production_decisions d
 )
 select
-  b.*,
+  b.signal_id,
+  b.prod_issues_24h,
+  b.prod_issues_7d,
+  b.last_prod_issue_at,
+  b.minutes_since_last_prod_issue,
+  b.severity_score_7d,
+  b.production_status,
+
+  b.trend_24h_vs_7d,
 
   case
     when b.production_status = 'incident' then 'high'
@@ -38,54 +45,11 @@ select
     else 'low'
   end as confidence,
 
-  -- Severity bins (score-only; for explain/debug)
+  -- Keep UI-friendly severity label (your UI expects severity_label)
   case
-    when b.severity_score_7d >= 80 then 3
-    when b.severity_score_7d >= 40 then 2
-    when b.severity_score_7d >= 15 then 1
-    else 0
-  end as severity_level_score,
-
-  case
-    when b.severity_score_7d >= 80 then 'High'
-    when b.severity_score_7d >= 40 then 'Medium'
-    when b.severity_score_7d >= 15 then 'Low'
-    else 'None'
-  end as severity_label_score,
-
-  -- Severity (final): status floor + score
-  greatest(
-    case
-      when b.production_status = 'incident' then 3
-      when b.production_status = 'investigate' then 2
-      when b.production_status = 'watch' then 1
-      else 0
-    end,
-    case
-      when b.severity_score_7d >= 80 then 3
-      when b.severity_score_7d >= 40 then 2
-      when b.severity_score_7d >= 15 then 1
-      else 0
-    end
-  ) as severity_level,
-
-  case greatest(
-    case
-      when b.production_status = 'incident' then 3
-      when b.production_status = 'investigate' then 2
-      when b.production_status = 'watch' then 1
-      else 0
-    end,
-    case
-      when b.severity_score_7d >= 80 then 3
-      when b.severity_score_7d >= 40 then 2
-      when b.severity_score_7d >= 15 then 1
-      else 0
-    end
-  )
-    when 3 then 'High'
-    when 2 then 'Medium'
-    when 1 then 'Low'
+    when b.severity_score_7d >= 200 then 'High'
+    when b.severity_score_7d >= 80 then 'Medium'
+    when b.severity_score_7d > 0 then 'Low'
     else 'None'
   end as severity_label,
 
@@ -114,7 +78,4 @@ select
     else
       'No action. Keep monitoring.'
   end as action_hint
-
 from base b;
-
-commit;
