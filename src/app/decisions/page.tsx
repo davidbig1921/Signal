@@ -1,17 +1,22 @@
 // ============================================================================
 // File: src/app/decisions/page.tsx
-// Version: 20260114-01-fixed-columns+deterministic+bulletproof (+decision version)
+// Version: 20260115-02-decision-version-header+safe-fetch
 // Project: Mercy Signal
 // Purpose:
-//   Render Production Decisions with deterministic ordering and optional explainability.
+//   Render Production Decisions with deterministic ordering + show decision version.
 // Notes:
-//   - Matches DB columns for current views:
-//       v_production_decisions:            suggested_action_code, suggested_action_text
-//       v_production_decisions_explain:    trend_24h_vs_7d, confidence, severity_label, status_reason_code
-//   - Severity label is ALWAYS available (fallback derived from score when explain view is absent).
-//   - Medium threshold = 80 (user chosen).
-//   - Sorting is fully deterministic (final tie-breaker on signal_id).
-//   - Shows active decision version (v_active_decision_logic_version) if present.
+//   - Best-effort data fetching: never throws if a view/table is missing.
+//   - Tries v_production_decisions_explain first, falls back to v_production_decisions.
+//   - Shows decision versions in header:
+//       Active logic version: v_ms_active_logic_version (preferred) OR ms_decision_logic_version where is_active=true
+//       Latest snapshot: ms_deploy_snapshot.logic_version_id (latest by created_at/inserted_at if present)
+//   - DB contract:
+//       v_production_decisions:
+//         signal_id, prod_issues_24h, prod_issues_7d, last_prod_issue_at,
+//         minutes_since_last_prod_issue, severity_score_7d, production_status,
+//         suggested_action_code, suggested_action_text
+//       v_production_decisions_explain adds:
+//         trend_24h_vs_7d, confidence, severity_label, status_reason_code
 // ============================================================================
 
 import React from "react";
@@ -22,573 +27,439 @@ type SeverityLabel = "High" | "Medium" | "Low" | "None";
 type TrendLabel = "worsening" | "stable" | "improving";
 type ConfidenceLabel = "high" | "medium" | "low";
 
-// Views
-const EXPLAIN_VIEW = "v_production_decisions_explain";
-const BASE_VIEW = "v_production_decisions";
-const ACTIVE_VERSION_VIEW = "v_active_decision_logic_version";
-
-// ============================================================================
-// Raw row shape from Supabase/PostgREST
-// (Optional columns exist only on v_production_decisions_explain)
-// ============================================================================
-
-type ProductionDecisionRow = {
+type BaseDecisionRow = {
   signal_id: string;
-
   prod_issues_24h: number;
   prod_issues_7d: number;
   last_prod_issue_at: string | null;
   minutes_since_last_prod_issue: number | null;
-
-  production_status: ProductionStatus;
   severity_score_7d: number;
-
-  // Locked suggested_action contract (always present in both views)
-  suggested_action_code?: string | null;
-  suggested_action_text?: string | null;
-
-  // Explainability view columns
-  trend_24h_vs_7d?: string | null; // worsening | stable | improving
-  confidence?: string | null; // high | medium | low
-  severity_label?: string | null; // High | Medium | Low | None
-  status_reason_code?: string | null; // enum/domain code
-
-  // Legacy (kept optional so UI never crashes if old views exist)
-  status_reason?: string | null;
-  action_hint?: string | null;
-  trend_label?: string | null;
-  confidence_label?: string | null;
-  confidence_score?: number | null;
+  production_status: ProductionStatus;
+  suggested_action_code: string | null;
+  suggested_action_text: string | null;
 };
 
-// Active decision version view row
-type ActiveDecisionVersionRow = {
-  decision_version_id: string | null;
-  decision_version_description: string | null;
+type ExplainDecisionRow = BaseDecisionRow & {
+  trend_24h_vs_7d: TrendLabel | null;
+  confidence: ConfidenceLabel | null;
+  severity_label: SeverityLabel | null;
+  status_reason_code: string | null;
 };
 
-// ============================================================================
-// Page
-// ============================================================================
+type DecisionRow = BaseDecisionRow | ExplainDecisionRow;
 
-export default async function DecisionsPage() {
-  const supabase = createSupabaseServerClient();
-
-  // Fetch active decision version (best-effort; do not fail page)
-  const activeVersion = await fetchActiveDecisionVersion(supabase);
-
-  const selectRequired = `
-    signal_id,
-    prod_issues_24h,
-    prod_issues_7d,
-    last_prod_issue_at,
-    minutes_since_last_prod_issue,
-    severity_score_7d,
-    production_status,
-    suggested_action_code,
-    suggested_action_text
-  `;
-
-  // Explain view fields MUST match DB column names
-  const selectWithExplain = `
-    ${selectRequired},
-    trend_24h_vs_7d,
-    confidence,
-    severity_label,
-    status_reason_code
-  `;
-
-  // Try explain view first, fallback to base view.
-  let data: any[] = [];
-  let usingExplain = false;
-
-  const r1 = await supabase.from(EXPLAIN_VIEW).select(selectWithExplain);
-
-  if (r1.error) {
-    const r2 = await supabase.from(BASE_VIEW).select(selectRequired);
-    if (r2.error) {
-      return (
-        <main className="min-h-screen bg-slate-50">
-          <div className="mx-auto max-w-4xl px-6 py-10">
-            <div className="rounded-2xl border border-red-200 bg-red-50 p-6">
-              <h1 className="text-xl font-semibold text-red-800">Production Decisions</h1>
-              <pre className="mt-4 overflow-auto rounded-xl bg-white/60 p-4 text-xs text-red-800 ring-1 ring-red-200">
-                {String(r2.error.message)}
-              </pre>
-            </div>
-          </div>
-        </main>
-      );
-    }
-    data = r2.data ?? [];
-    usingExplain = false;
-  } else {
-    data = r1.data ?? [];
-    usingExplain = true;
-  }
-
-  const rows: NormalizedDecisionRow[] = (data as ProductionDecisionRow[]).map(normalizeDecisionRow);
-
-  const sorted: NormalizedDecisionRow[] = [...rows].sort((a, b) => {
-    const sr = statusRank(a.production_status) - statusRank(b.production_status);
-    if (sr !== 0) return sr;
-
-    if (a.prod_issues_24h !== b.prod_issues_24h) return b.prod_issues_24h - a.prod_issues_24h;
-    if (a.prod_issues_7d !== b.prod_issues_7d) return b.prod_issues_7d - a.prod_issues_7d;
-
-    const am = a.minutes_since_last_prod_issue;
-    const bm = b.minutes_since_last_prod_issue;
-
-    if (am == null && bm == null) {
-      return (a.signal_id || "").localeCompare(b.signal_id || "");
-    }
-    if (am == null) return 1;
-    if (bm == null) return -1;
-
-    const recency = am - bm;
-    if (recency !== 0) return recency;
-
-    return (a.signal_id || "").localeCompare(b.signal_id || "");
-  });
-
+function isExplainRow(r: DecisionRow): r is ExplainDecisionRow {
   return (
-    <main className="min-h-screen bg-slate-50">
-      <div className="mx-auto max-w-6xl px-6 py-10">
-        <div className="flex flex-wrap items-end justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-              Production Decisions
-            </h1>
-            <p className="mt-1 text-sm text-slate-600">
-              View:{" "}
-              <span className="font-mono text-slate-800">
-                {usingExplain ? EXPLAIN_VIEW : BASE_VIEW}
-              </span>
-            </p>
-          </div>
-
-          <div className="flex items-center gap-2 text-sm text-slate-600">
-            <span className="text-slate-500">Decision logic</span>
-            <span className="rounded-full border border-slate-200 bg-white px-3 py-1 font-mono text-xs text-slate-800">
-              {activeVersion?.decision_version_id ?? "unknown"}
-            </span>
-            {activeVersion?.decision_version_description ? (
-              <span className="hidden max-w-[420px] truncate text-slate-500 sm:inline">
-                {activeVersion.decision_version_description}
-              </span>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="mt-6 rounded-2xl border border-slate-200 bg-white shadow-sm">
-          <div className="overflow-x-auto">
-            <table className="min-w-full border-separate border-spacing-0">
-              <thead>
-                <tr className="text-left text-xs text-slate-500">
-                  <Th>Status</Th>
-                  <Th className="text-right">24h</Th>
-                  <Th className="text-right">7d</Th>
-                  <Th>Last issue</Th>
-                  <Th>Recency</Th>
-                  <Th className="text-right">Severity</Th>
-                  <Th>Suggested</Th>
-                  <Th>Signal</Th>
-                </tr>
-              </thead>
-
-              <tbody>
-                {sorted.map((r, idx) => (
-                  <tr
-                    key={r.signal_id || `row-${idx}`}
-                    className="border-t border-slate-100 hover:bg-slate-50/60"
-                  >
-                    <Td>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span
-                          className={[
-                            "inline-flex w-fit items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset",
-                            pillClasses(r.production_status),
-                          ].join(" ")}
-                        >
-                          {r.production_status}
-                        </span>
-
-                        <span
-                          className={[
-                            "inline-flex w-fit items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset",
-                            severityPillClasses(r.severity_label),
-                          ].join(" ")}
-                          title={`Severity score (7d): ${r.severity_score_7d}`}
-                        >
-                          {r.severity_label}
-                        </span>
-
-                        {usingExplain ? (
-                          <>
-                            <span
-                              className={[
-                                "inline-flex w-fit items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset",
-                                trendPillClasses(r.trend_label),
-                              ].join(" ")}
-                              title="Trend: 24h compared to 7d daily baseline"
-                            >
-                              {labelTrend(r.trend_label)}
-                            </span>
-
-                            <span
-                              className={[
-                                "inline-flex w-fit items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset",
-                                confidencePillClasses(r.confidence_label),
-                              ].join(" ")}
-                              title="Confidence"
-                            >
-                              {labelConfidence(r.confidence_label)}
-                            </span>
-                          </>
-                        ) : null}
-                      </div>
-
-                      {usingExplain ? (
-                        <div className="mt-2 space-y-1 text-xs text-slate-600">
-                          <div>
-                            <span className="font-medium text-slate-700">Reason:</span>{" "}
-                            {r.status_reason_code ?? "—"}
-                          </div>
-                        </div>
-                      ) : null}
-                    </Td>
-
-                    <Td className="text-right tabular-nums">{r.prod_issues_24h}</Td>
-                    <Td className="text-right tabular-nums">{r.prod_issues_7d}</Td>
-                    <Td className="whitespace-nowrap">{fmtDateTime(r.last_prod_issue_at)}</Td>
-                    <Td className="whitespace-nowrap">
-                      {fmtRecency(r.minutes_since_last_prod_issue)}
-                    </Td>
-
-                    <Td className="text-right tabular-nums">
-                      <span className="font-medium">{r.severity_score_7d}</span>
-                      <span className="ml-1 text-xs text-slate-500">({r.severity_label})</span>
-                    </Td>
-
-                    <Td>
-                      <div className="space-y-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <span className="rounded-full bg-slate-50 px-2.5 py-1 text-xs font-mono text-slate-700 ring-1 ring-slate-200">
-                            {r.suggested_action_code ?? "—"}
-                          </span>
-                        </div>
-                        <div className="text-xs text-slate-600">{r.suggested_action_text ?? "—"}</div>
-                      </div>
-                    </Td>
-
-                    <Td>
-                      <span className="font-mono text-xs text-slate-700">{shortId(r.signal_id)}</span>
-                    </Td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-
-          {usingExplain ? (
-            <div className="border-t border-slate-200 px-5 py-3 text-xs text-slate-500">
-              <span className="font-medium text-slate-700">Trend:</span> 24h vs 7d baseline (↑ worse,
-              ↓ better, → flat).{" "}
-              <span className="ml-2 font-medium text-slate-700">Confidence:</span> based on 7d volume +
-              incident weighting.
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </main>
+    (r as ExplainDecisionRow).trend_24h_vs_7d !== undefined ||
+    (r as ExplainDecisionRow).confidence !== undefined ||
+    (r as ExplainDecisionRow).severity_label !== undefined ||
+    (r as ExplainDecisionRow).status_reason_code !== undefined
   );
 }
 
-// ============================================================================
-// DB helpers (best-effort; never fail page)
-// ============================================================================
-
-async function fetchActiveDecisionVersion(
-  supabase: ReturnType<typeof createSupabaseServerClient>
-): Promise<ActiveDecisionVersionRow | null> {
-  try {
-    const r = await supabase
-      .from(ACTIVE_VERSION_VIEW)
-      .select("decision_version_id, decision_version_description")
-      .maybeSingle();
-
-    if (r.error) return null;
-    if (!r.data) return null;
-
-    return {
-      decision_version_id:
-        typeof r.data.decision_version_id === "string" && r.data.decision_version_id.trim()
-          ? r.data.decision_version_id.trim()
-          : null,
-      decision_version_description:
-        typeof r.data.decision_version_description === "string" &&
-        r.data.decision_version_description.trim()
-          ? r.data.decision_version_description.trim()
-          : null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
 function statusRank(status: ProductionStatus): number {
+  // Higher = more urgent
   switch (status) {
     case "incident":
-      return 1;
-    case "investigate":
-      return 2;
-    case "watch":
-      return 3;
-    case "ok":
       return 4;
-    default:
-      return 999;
-  }
-}
-
-function pillClasses(status: ProductionStatus): string {
-  switch (status) {
-    case "incident":
-      return "bg-red-50 text-red-700 ring-red-200";
     case "investigate":
-      return "bg-amber-50 text-amber-700 ring-amber-200";
+      return 3;
     case "watch":
-      return "bg-blue-50 text-blue-700 ring-blue-200";
+      return 2;
     case "ok":
-      return "bg-emerald-50 text-emerald-700 ring-emerald-200";
     default:
-      return "bg-slate-50 text-slate-700 ring-slate-200";
+      return 1;
   }
 }
 
-function severityPillClasses(label: SeverityLabel): string {
-  switch (label) {
-    case "High":
-      return "bg-red-50 text-red-700 ring-red-200";
-    case "Medium":
-      return "bg-amber-50 text-amber-700 ring-amber-200";
-    case "Low":
-      return "bg-yellow-50 text-yellow-800 ring-yellow-200";
-    default:
-      return "bg-slate-50 text-slate-700 ring-slate-200";
-  }
+function safeNum(n: unknown, fallback = 0): number {
+  return typeof n === "number" && Number.isFinite(n) ? n : fallback;
 }
 
-function trendPillClasses(trend: TrendLabel | null): string {
-  switch (trend) {
-    case "worsening":
-      return "bg-red-50 text-red-700 ring-red-200";
-    case "improving":
-      return "bg-emerald-50 text-emerald-700 ring-emerald-200";
-    case "stable":
-      return "bg-slate-50 text-slate-700 ring-slate-200";
-    default:
-      return "bg-slate-50 text-slate-700 ring-slate-200";
-  }
-}
-
-function confidencePillClasses(conf: ConfidenceLabel | null): string {
-  switch (conf) {
-    case "high":
-      return "bg-emerald-50 text-emerald-700 ring-emerald-200";
-    case "medium":
-      return "bg-amber-50 text-amber-700 ring-amber-200";
-    case "low":
-      return "bg-slate-50 text-slate-700 ring-slate-200";
-    default:
-      return "bg-slate-50 text-slate-700 ring-slate-200";
-  }
-}
-
-function labelTrend(trend: TrendLabel | null): string {
-  if (trend === "worsening") return "↑ Trend";
-  if (trend === "improving") return "↓ Trend";
-  if (trend === "stable") return "→ Trend";
-  return "Trend";
-}
-
-function labelConfidence(conf: ConfidenceLabel | null): string {
-  if (conf === "high") return "High conf";
-  if (conf === "medium") return "Med conf";
-  if (conf === "low") return "Low conf";
-  return "Conf";
-}
-
-function fmtDateTime(iso: string | null): string {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  return new Intl.DateTimeFormat(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(d);
-}
-
-function fmtRecency(minutes: number | null): string {
-  if (minutes == null || !Number.isFinite(minutes)) return "—";
-  const m = Math.max(0, Math.floor(minutes));
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  return `${d}d ago`;
-}
-
-function shortId(id: string): string {
-  if (!id) return "—";
-  if (id.length <= 16) return id;
-  return `${id.slice(0, 8)}…${id.slice(-6)}`;
-}
-
-function tinyHash(input: string): string {
-  let h = 2166136261;
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0).toString(16);
-}
-
-// ============================================================================
-// Normalization
-// ============================================================================
-
-type NormalizedDecisionRow = {
-  signal_id: string;
-  prod_issues_24h: number;
-  prod_issues_7d: number;
-  last_prod_issue_at: string | null;
-  minutes_since_last_prod_issue: number | null;
-
-  production_status: ProductionStatus;
-  severity_score_7d: number;
-
-  suggested_action_code: string | null;
-  suggested_action_text: string | null;
-
-  status_reason_code: string | null;
-
-  severity_label: SeverityLabel;
-
-  trend_label: TrendLabel | null;
-  confidence_label: ConfidenceLabel | null;
-};
-
-function toNumberOrNull(v: unknown): number | null {
-  if (typeof v === "number" && Number.isFinite(v)) return v;
-  if (typeof v === "string") {
-    const t = v.trim();
-    if (!t) return null;
-    const n = Number(t);
-    return Number.isFinite(n) ? n : null;
-  }
-  return null;
-}
-
-function toIntOrZero(v: unknown): number {
-  const n = toNumberOrNull(v);
-  return n == null ? 0 : Math.trunc(n);
-}
-
-function toStringOrNull(v: unknown): string | null {
-  if (typeof v !== "string") return null;
-  const t = v.trim();
-  return t.length ? t : null;
-}
-
-function asSeverityLabel(v: unknown): SeverityLabel {
-  return v === "High" || v === "Medium" || v === "Low" || v === "None" ? v : "None";
-}
-
-function deriveSeverityLabelFromScore(score: number): SeverityLabel {
+function deriveSeverityLabel(score: number): SeverityLabel {
+  // Fallback-only heuristic (UI must always have a label even if explain view absent)
   if (score >= 200) return "High";
   if (score >= 80) return "Medium";
-  if (score >= 1) return "Low";
+  if (score > 0) return "Low";
   return "None";
 }
 
-function asProductionStatus(v: unknown): ProductionStatus {
-  return v === "incident" || v === "investigate" || v === "watch" || v === "ok" ? v : "ok";
+function formatAgoMinutes(minutes: number | null): string {
+  if (minutes == null || !Number.isFinite(minutes)) return "—";
+  if (minutes < 60) return `${Math.floor(minutes)}m`;
+  const h = Math.floor(minutes / 60);
+  const m = Math.floor(minutes % 60);
+  if (h < 24) return `${h}h ${m}m`;
+  const d = Math.floor(h / 24);
+  const hh = h % 24;
+  return `${d}d ${hh}h`;
 }
 
-function asTrend(v: unknown): TrendLabel | null {
-  return v === "worsening" || v === "stable" || v === "improving" ? v : null;
+function pillClass(base: string) {
+  return `inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${base}`;
 }
 
-function asConfidence(v: unknown): ConfidenceLabel | null {
-  return v === "high" || v === "medium" || v === "low" ? v : null;
+function statusPill(status: ProductionStatus) {
+  switch (status) {
+    case "incident":
+      return pillClass("bg-red-50 text-red-700 ring-red-200");
+    case "investigate":
+      return pillClass("bg-amber-50 text-amber-700 ring-amber-200");
+    case "watch":
+      return pillClass("bg-blue-50 text-blue-700 ring-blue-200");
+    case "ok":
+    default:
+      return pillClass("bg-emerald-50 text-emerald-700 ring-emerald-200");
+  }
 }
 
-function normalizeDecisionRow(row: any): NormalizedDecisionRow {
-  const rawId =
-    typeof row?.signal_id === "string" && row.signal_id.trim() ? row.signal_id.trim() : "";
-
-  const signal_id = rawId || `missing:${tinyHash(JSON.stringify(row ?? {}))}`;
-
-  const severity_score_7d = toIntOrZero(row?.severity_score_7d);
-
-  // Prefer explain's severity_label; fallback derived from score
-  const rawLabel = asSeverityLabel(row?.severity_label);
-  const severity_label =
-    rawLabel !== "None" ? rawLabel : deriveSeverityLabelFromScore(severity_score_7d);
-
-  // Prefer explain columns; allow legacy fields if user is on older view
-  const trendRaw =
-    row?.trend_24h_vs_7d != null ? row.trend_24h_vs_7d : row?.trend_label != null ? row.trend_label : null;
-
-  const confRaw =
-    row?.confidence != null ? row.confidence : row?.confidence_label != null ? row.confidence_label : null;
-
-  return {
-    signal_id,
-    prod_issues_24h: toIntOrZero(row?.prod_issues_24h),
-    prod_issues_7d: toIntOrZero(row?.prod_issues_7d),
-    last_prod_issue_at:
-      typeof row?.last_prod_issue_at === "string" && row.last_prod_issue_at.trim()
-        ? row.last_prod_issue_at.trim()
-        : null,
-    minutes_since_last_prod_issue: toNumberOrNull(row?.minutes_since_last_prod_issue),
-
-    production_status: asProductionStatus(row?.production_status),
-    severity_score_7d,
-
-    suggested_action_code: toStringOrNull(row?.suggested_action_code),
-    suggested_action_text: toStringOrNull(row?.suggested_action_text),
-
-    status_reason_code: toStringOrNull(row?.status_reason_code) ?? toStringOrNull(row?.status_reason),
-
-    severity_label,
-
-    trend_label: asTrend(trendRaw),
-    confidence_label: asConfidence(confRaw),
-  };
+function severityPill(label: SeverityLabel) {
+  switch (label) {
+    case "High":
+      return pillClass("bg-red-50 text-red-700 ring-red-200");
+    case "Medium":
+      return pillClass("bg-amber-50 text-amber-700 ring-amber-200");
+    case "Low":
+      return pillClass("bg-blue-50 text-blue-700 ring-blue-200");
+    case "None":
+    default:
+      return pillClass("bg-slate-50 text-slate-700 ring-slate-200");
+  }
 }
 
-function Th({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+function trendPill(label: TrendLabel) {
+  switch (label) {
+    case "worsening":
+      return pillClass("bg-red-50 text-red-700 ring-red-200");
+    case "improving":
+      return pillClass("bg-emerald-50 text-emerald-700 ring-emerald-200");
+    case "stable":
+    default:
+      return pillClass("bg-slate-50 text-slate-700 ring-slate-200");
+  }
+}
+
+function confidencePill(label: ConfidenceLabel) {
+  switch (label) {
+    case "high":
+      return pillClass("bg-emerald-50 text-emerald-700 ring-emerald-200");
+    case "medium":
+      return pillClass("bg-amber-50 text-amber-700 ring-amber-200");
+    case "low":
+    default:
+      return pillClass("bg-slate-50 text-slate-700 ring-slate-200");
+  }
+}
+
+async function trySelect<T>(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: any,
+  tableOrView: string,
+  select: string,
+  opts?: {
+    order?: { column: string; ascending?: boolean; nullsFirst?: boolean };
+    limit?: number;
+    eq?: { column: string; value: string | number | boolean };
+  }
+): Promise<{ data: T[]; ok: boolean }> {
+  try {
+    let q = supabase.from(tableOrView).select(select);
+
+    if (opts?.eq) q = q.eq(opts.eq.column, opts.eq.value);
+    if (opts?.order) {
+      q = q.order(opts.order.column, {
+        ascending: opts.order.ascending ?? false,
+        nullsFirst: opts.order.nullsFirst,
+      });
+    }
+    if (opts?.limit != null) q = q.limit(opts.limit);
+
+    const { data, error } = await q;
+    if (error || !data) return { data: [], ok: false };
+    return { data: data as T[], ok: true };
+  } catch {
+    return { data: [], ok: false };
+  }
+}
+
+async function fetchDecisionRows(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: any
+): Promise<{ rows: DecisionRow[]; usingExplain: boolean }> {
+  // Try explain view first
+  const explain = await trySelect<ExplainDecisionRow>(
+    supabase,
+    "v_production_decisions_explain",
+    `
+      signal_id,
+      prod_issues_24h,
+      prod_issues_7d,
+      last_prod_issue_at,
+      minutes_since_last_prod_issue,
+      severity_score_7d,
+      production_status,
+      suggested_action_code,
+      suggested_action_text,
+      trend_24h_vs_7d,
+      confidence,
+      severity_label,
+      status_reason_code
+    `
+  );
+
+  if (explain.ok && explain.data.length > 0) {
+    return { rows: explain.data, usingExplain: true };
+  }
+
+  // Fallback to base view
+  const base = await trySelect<BaseDecisionRow>(
+    supabase,
+    "v_production_decisions",
+    `
+      signal_id,
+      prod_issues_24h,
+      prod_issues_7d,
+      last_prod_issue_at,
+      minutes_since_last_prod_issue,
+      severity_score_7d,
+      production_status,
+      suggested_action_code,
+      suggested_action_text
+    `
+  );
+
+  return { rows: base.data, usingExplain: false };
+}
+
+async function fetchActiveLogicVersion(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: any
+): Promise<string | null> {
+  // Preferred: v_ms_active_logic_version
+  const view = await trySelect<{ logic_version_id: string }>(
+    supabase,
+    "v_ms_active_logic_version",
+    "logic_version_id",
+    { limit: 1 }
+  );
+  if (view.ok && view.data[0]?.logic_version_id) return view.data[0].logic_version_id;
+
+  // Fallback: ms_decision_logic_version where is_active=true
+  const tbl = await trySelect<{ id: string }>(
+    supabase,
+    "ms_decision_logic_version",
+    "id",
+    { eq: { column: "is_active", value: true }, limit: 1 }
+  );
+  if (tbl.ok && tbl.data[0]?.id) return tbl.data[0].id;
+
+  return null;
+}
+
+async function fetchLatestSnapshotLogicVersion(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  supabase: any
+): Promise<{ logicVersionId: string | null; snapshotAt: string | null }> {
+  // We don’t know which timestamp column exists, so we try best-effort:
+  // 1) order by created_at
+  // 2) order by inserted_at
+  // 3) no order (limit 1)
+  const first = await trySelect<{ logic_version_id: string; created_at?: string | null }>(
+    supabase,
+    "ms_deploy_snapshot",
+    "logic_version_id, created_at",
+    { order: { column: "created_at", ascending: false }, limit: 1 }
+  );
+  if (first.ok && first.data[0]?.logic_version_id) {
+    return {
+      logicVersionId: first.data[0].logic_version_id ?? null,
+      snapshotAt: (first.data[0] as any).created_at ?? null,
+    };
+  }
+
+  const second = await trySelect<{ logic_version_id: string; inserted_at?: string | null }>(
+    supabase,
+    "ms_deploy_snapshot",
+    "logic_version_id, inserted_at",
+    { order: { column: "inserted_at", ascending: false }, limit: 1 }
+  );
+  if (second.ok && second.data[0]?.logic_version_id) {
+    return {
+      logicVersionId: second.data[0].logic_version_id ?? null,
+      snapshotAt: (second.data[0] as any).inserted_at ?? null,
+    };
+  }
+
+  const third = await trySelect<{ logic_version_id: string }>(
+    supabase,
+    "ms_deploy_snapshot",
+    "logic_version_id",
+    { limit: 1 }
+  );
+  if (third.ok && third.data[0]?.logic_version_id) {
+    return { logicVersionId: third.data[0].logic_version_id ?? null, snapshotAt: null };
+  }
+
+  return { logicVersionId: null, snapshotAt: null };
+}
+
+function sortRows(rows: DecisionRow[]): DecisionRow[] {
+  // Deterministic: status desc, severity desc, 24h desc, 7d desc, recency asc, signal_id asc
+  return [...rows].sort((a, b) => {
+    const sr = statusRank(b.production_status) - statusRank(a.production_status);
+    if (sr !== 0) return sr;
+
+    const sev = safeNum(b.severity_score_7d) - safeNum(a.severity_score_7d);
+    if (sev !== 0) return sev;
+
+    const i24 = safeNum(b.prod_issues_24h) - safeNum(a.prod_issues_24h);
+    if (i24 !== 0) return i24;
+
+    const i7 = safeNum(b.prod_issues_7d) - safeNum(a.prod_issues_7d);
+    if (i7 !== 0) return i7;
+
+    const ra = a.minutes_since_last_prod_issue ?? Number.POSITIVE_INFINITY;
+    const rb = b.minutes_since_last_prod_issue ?? Number.POSITIVE_INFINITY;
+    if (ra !== rb) return ra - rb;
+
+    return a.signal_id.localeCompare(b.signal_id);
+  });
+}
+
+function shortId(id: string | null): string {
+  if (!id) return "unknown";
+  // Keep readable but stable
+  return id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+}
+
+function ProductionDecisionCard({ row, usingExplain }: { row: DecisionRow; usingExplain: boolean }) {
+  const score = safeNum(row.severity_score_7d);
+  const explain = isExplainRow(row) ? row : null;
+  const severityLabel: SeverityLabel =
+    explain?.severity_label ?? deriveSeverityLabel(score);
+
   return (
-    <th
-      className={[
-        "sticky top-0 z-10 border-b border-slate-200 bg-white/90 px-5 py-3 font-medium backdrop-blur",
-        className,
-      ].join(" ")}
-    >
-      {children}
-    </th>
+    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className={statusPill(row.production_status)}>{row.production_status}</span>
+            <span className={severityPill(severityLabel)}>{severityLabel}</span>
+
+            {usingExplain && explain?.trend_24h_vs_7d ? (
+              <span className={trendPill(explain.trend_24h_vs_7d)}>{explain.trend_24h_vs_7d}</span>
+            ) : null}
+
+            {usingExplain && explain?.confidence ? (
+              <span className={confidencePill(explain.confidence)}>{explain.confidence}</span>
+            ) : null}
+          </div>
+
+          <div className="mt-2 text-sm text-slate-600">
+            <span className="font-mono text-slate-800">{row.signal_id}</span>
+          </div>
+        </div>
+
+        <div className="text-right text-sm text-slate-600">
+          <div>
+            <span className="font-medium text-slate-800">{safeNum(row.prod_issues_24h)}</span> /24h
+          </div>
+          <div>
+            <span className="font-medium text-slate-800">{safeNum(row.prod_issues_7d)}</span> /7d
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
+        <div className="rounded-xl bg-slate-50 p-3">
+          <div className="text-slate-500">Severity score (7d)</div>
+          <div className="mt-1 text-lg font-semibold text-slate-900">{score}</div>
+        </div>
+        <div className="rounded-xl bg-slate-50 p-3">
+          <div className="text-slate-500">Last prod issue</div>
+          <div className="mt-1 font-semibold text-slate-900">
+            {formatAgoMinutes(row.minutes_since_last_prod_issue)}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
+        <div className="text-xs text-slate-500">Suggested action</div>
+        <div className="mt-1 text-sm font-medium text-slate-900">
+          {row.suggested_action_text ?? "—"}
+        </div>
+        {row.suggested_action_code ? (
+          <div className="mt-1 text-xs text-slate-500">
+            code: <span className="font-mono">{row.suggested_action_code}</span>
+          </div>
+        ) : null}
+      </div>
+
+      {usingExplain && explain?.status_reason_code ? (
+        <div className="mt-3 text-xs text-slate-500">
+          reason: <span className="font-mono">{explain.status_reason_code}</span>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
-function Td({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return <td className={["px-5 py-4 text-sm text-slate-800", className].join(" ")}>{children}</td>;
+export default async function DecisionsPage() {
+  const supabase = await createSupabaseServerClient();
+
+  // Fetch decisions (best-effort)
+  const { rows: rawRows, usingExplain } = await fetchDecisionRows(supabase);
+  const rows = sortRows(rawRows);
+
+  // Fetch decision version info (best-effort)
+  const activeLogicVersionId = await fetchActiveLogicVersion(supabase);
+  const latestSnapshot = await fetchLatestSnapshotLogicVersion(supabase);
+
+  return (
+    <div className="mx-auto w-full max-w-6xl px-4 py-8">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+            Production Decisions
+          </h1>
+
+          <div className="mt-1 text-sm text-slate-600">
+            Decision logic:{" "}
+            <span className="font-medium text-slate-900">
+              Active {shortId(activeLogicVersionId)}
+            </span>
+            {" · "}
+            <span className="font-medium text-slate-900">
+              Snapshot {shortId(latestSnapshot.logicVersionId)}
+            </span>
+            {latestSnapshot.snapshotAt ? (
+              <span className="text-slate-500"> (at {latestSnapshot.snapshotAt})</span>
+            ) : null}
+          </div>
+
+          <div className="mt-1 text-xs text-slate-500">
+            Data source: {usingExplain ? "v_production_decisions_explain" : "v_production_decisions"}{" "}
+            (best-effort fallback)
+          </div>
+        </div>
+
+        <div className="text-xs text-slate-500">
+          Rows: <span className="font-medium text-slate-700">{rows.length}</span>
+        </div>
+      </div>
+
+      <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
+        {rows.length === 0 ? (
+          <div className="rounded-2xl border border-slate-200 bg-white p-6 text-sm text-slate-600">
+            No decision rows returned. (If this is unexpected, verify RLS/auth cookies and that the views
+            exist in the current schema.)
+          </div>
+        ) : (
+          rows.map((r) => (
+            <ProductionDecisionCard key={r.signal_id} row={r} usingExplain={usingExplain} />
+          ))
+        )}
+      </div>
+    </div>
+  );
 }
