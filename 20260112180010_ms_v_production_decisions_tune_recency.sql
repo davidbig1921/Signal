@@ -2,15 +2,23 @@
 -- Migration: ms_v_production_decisions_tune_recency
 -- Purpose:
 --   - Rebuild v_production_decisions deterministically
---   - Avoid view-column rename conflicts by dropping then recreating
---   - Append-only: suggested_action_code + suggested_action_text
+--   - Avoid column-rename conflicts by drop+recreate
+--   - Handle dependent views (v_production_decisions_explain)
+--   - Keep stable contract + allow later migrations to tune explain view
 -- =============================================================================
 
 begin;
 
--- Drop base view and anything that depends on it (e.g., v_production_decisions_explain)
-drop view if exists public.v_production_decisions cascade;
+-- -----------------------------------------------------------------------------
+-- Drop dependent views first (so base can be dropped cleanly)
+-- -----------------------------------------------------------------------------
+drop view if exists public.v_production_decisions_explain;
 
+drop view if exists public.v_production_decisions;
+
+-- -----------------------------------------------------------------------------
+-- Recreate base view
+-- -----------------------------------------------------------------------------
 create view public.v_production_decisions as
 with prod as (
   select
@@ -78,7 +86,7 @@ select
     b.severity_score_7d
   ) as production_status,
 
-  -- Keep legacy column name for compatibility with earlier UI/migrations
+  -- legacy column kept for historical compatibility
   case public.ms_production_status(
     b.prod_issues_24h,
     b.prod_issues_7d,
@@ -91,7 +99,7 @@ select
     else 'noop'
   end as status_reason,
 
-  -- New append-only columns (modern contract)
+  -- modern append-only columns
   case public.ms_production_status(
     b.prod_issues_24h,
     b.prod_issues_7d,
@@ -119,5 +127,34 @@ select
   ) as suggested_action_text
 
 from base b;
+
+-- -----------------------------------------------------------------------------
+-- Recreate an explain view stub (later migrations can replace/tune it)
+-- -----------------------------------------------------------------------------
+create view public.v_production_decisions_explain as
+select
+  d.signal_id,
+  d.prod_issues_24h,
+  d.prod_issues_7d,
+  d.last_prod_issue_at,
+  d.minutes_since_last_prod_issue,
+  d.severity_score_7d,
+  d.production_status,
+
+  -- keep modern contract columns if present in base
+  d.suggested_action_code,
+  d.suggested_action_text,
+
+  -- explain-only columns as safe defaults
+  'stable'::text as trend_24h_vs_7d,
+  'low'::text as confidence,
+  case
+    when coalesce(d.severity_score_7d, 0) >= 200 then 'High'
+    when coalesce(d.severity_score_7d, 0) >= 80 then 'Medium'
+    when coalesce(d.severity_score_7d, 0) > 0 then 'Low'
+    else 'None'
+  end as severity_label,
+  null::text as status_reason_code
+from public.v_production_decisions d;
 
 commit;

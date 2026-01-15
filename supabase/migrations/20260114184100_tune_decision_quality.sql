@@ -1,4 +1,18 @@
-create or replace view public.v_production_decisions_explain as
+-- =============================================================================
+-- Migration: ms_v_production_decisions_explain
+-- Purpose:
+--   - Provide explainability signals on top of v_production_decisions
+--   - Includes trend, confidence, severity labels, human-readable reasons
+--   - Reset-safe: drop + create (no OR REPLACE)
+-- =============================================================================
+
+begin;
+
+-- IMPORTANT:
+-- Drop first to avoid column-rename conflicts during reset
+drop view if exists public.v_production_decisions_explain cascade;
+
+create view public.v_production_decisions_explain as
 with base as (
   select
     d.*,
@@ -70,7 +84,7 @@ select
       'No meaningful production risk detected.'
   end as status_reason,
 
-  -- Action hint
+  -- Action hint (human guidance only; no logic encoded here)
   case
     when s.production_status = 'incident'
       then 'Page on-call and begin incident response.'
@@ -86,3 +100,5 @@ from scored s;
 
 comment on view public.v_production_decisions_explain is
 'Adds trend_label (24h vs 7d baseline), confidence_score/label (volume+status), severity_label, status_reason, action_hint for explainable decisions.';
+
+commit;
