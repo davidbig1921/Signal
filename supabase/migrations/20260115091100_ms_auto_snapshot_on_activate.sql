@@ -7,11 +7,11 @@
 
 begin;
 
--- Only create the trigger if both the function and table exist.
+-- Only create the trigger if the table AND trigger function exist.
 do $$
 begin
   if to_regclass('public.ms_decision_logic_version') is not null
-     and to_regprocedure('public.ms_take_deploy_snapshot(text,text,text)') is not null then
+     and to_regprocedure('public.ms_on_decision_logic_activated()') is not null then
 
     -- Create trigger only if missing
     if not exists (

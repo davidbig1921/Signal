@@ -1,65 +1,45 @@
 // ============================================================================
 // File: src/lib/supabase/server.ts
-// Version: 20260112-08
 // Project: Mercy Signal
 // Purpose:
-//   Create a Supabase client for Next.js App Router Server Components.
+//   Supabase server client for Next.js App Router (Server Components safe).
 // Notes:
-//   - Cookie store API varies across Next/Turbopack builds.
-//   - This adapter must NEVER throw.
+//   - This client is SAFE to use in Server Components: it ONLY reads cookies.
+//   - It does NOT attempt to set cookies (which would trigger Next warnings).
+//   - Use a separate Route Handler / Server Action client if you need write-cookies.
 // ============================================================================
 
-import { cookies } from "next/headers";
+import "server-only";
+
 import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
 
-type CookieLike = { name: string; value: string };
-
-function safeGetAllCookies(cookieStore: any): CookieLike[] {
-  try {
-    if (cookieStore && typeof cookieStore.getAll === "function") {
-      return cookieStore.getAll();
-    }
-  } catch {
-    // ignore
-  }
-
-  // Fallback: best-effort extraction for common Supabase cookie names.
-  const names = [
-    "sb-access-token",
-    "sb-refresh-token",
-    "sb-auth-token",
-    "supabase-auth-token",
-  ];
-
-  const out: CookieLike[] = [];
-  for (const name of names) {
-    try {
-      const c = cookieStore?.get?.(name);
-      if (c?.value) out.push({ name, value: c.value });
-    } catch {
-      // ignore
-    }
-  }
-  return out;
+function mustGetEnv(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
 }
 
-export function createSupabaseServerClient() {
-  const cookieStore = cookies();
+export async function createSupabaseServerClient() {
+  const cookieStore = await cookies();
 
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  const supabaseUrl = mustGetEnv("NEXT_PUBLIC_SUPABASE_URL");
+  const supabaseAnonKey = mustGetEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY");
 
-  if (!url || !anonKey) {
-    throw new Error("Missing NEXT_PUBLIC_SUPABASE_URL or NEXT_PUBLIC_SUPABASE_ANON_KEY");
-  }
-
-  return createServerClient(url, anonKey, {
+  // Server Components: READ-ONLY cookies.
+  // Setting cookies here causes:
+  // "Cookies can only be modified in a Server Action or Route Handler"
+  return createServerClient(supabaseUrl, supabaseAnonKey, {
     cookies: {
       getAll() {
-        return safeGetAllCookies(cookieStore);
+        return cookieStore.getAll().map((c) => ({
+          name: c.name,
+          value: c.value,
+        }));
       },
       setAll() {
-        // no-op in Server Components
+        // Intentionally no-op in Server Components.
+        // If you need auth refresh that writes cookies, do it in middleware or a route handler.
       },
     },
   });

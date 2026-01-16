@@ -1,26 +1,20 @@
 // ============================================================================
 // File: src/app/decisions/page.tsx
-// Version: 20260115-02-decision-version-header+safe-fetch
+// Version: 20260115-09-decisions-page-client-link-wrapper-alive-feedback (fixed)
 // Project: Mercy Signal
 // Purpose:
-//   Render Production Decisions with deterministic ordering + show decision version.
+//   Render Production Decisions with deterministic ordering + show decision versions.
 // Notes:
-//   - Best-effort data fetching: never throws if a view/table is missing.
-//   - Tries v_production_decisions_explain first, falls back to v_production_decisions.
-//   - Shows decision versions in header:
-//       Active logic version: v_ms_active_logic_version (preferred) OR ms_decision_logic_version where is_active=true
-//       Latest snapshot: ms_deploy_snapshot.logic_version_id (latest by created_at/inserted_at if present)
-//   - DB contract:
-//       v_production_decisions:
-//         signal_id, prod_issues_24h, prod_issues_7d, last_prod_issue_at,
-//         minutes_since_last_prod_issue, severity_score_7d, production_status,
-//         suggested_action_code, suggested_action_text
-//       v_production_decisions_explain adds:
-//         trend_24h_vs_7d, confidence, severity_label, status_reason_code
+//   - Server Component
+//   - Tooltips use a client-only component via a wrapper (portal; no clipping)
+//   - If no rows accessible (RLS / unauth), show demo card + explicit banner
+//   - Cards are clickable to /decisions/[signal_id] with instant click feedback
 // ============================================================================
 
 import React from "react";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
+import TooltipId from "./TooltipId"; // ✅ wrapper (server-safe)
+import DecisionCardLink from "./DecisionCardLink.client"; // ✅ alive click feedback
 
 type ProductionStatus = "incident" | "investigate" | "watch" | "ok";
 type SeverityLabel = "High" | "Medium" | "Low" | "None";
@@ -40,10 +34,10 @@ type BaseDecisionRow = {
 };
 
 type ExplainDecisionRow = BaseDecisionRow & {
-  trend_24h_vs_7d: TrendLabel | null;
-  confidence: ConfidenceLabel | null;
-  severity_label: SeverityLabel | null;
-  status_reason_code: string | null;
+  trend_24h_vs_7d?: TrendLabel | null;
+  confidence?: ConfidenceLabel | null;
+  severity_label?: SeverityLabel | null;
+  status_reason_code?: string | null;
 };
 
 type DecisionRow = BaseDecisionRow | ExplainDecisionRow;
@@ -58,7 +52,6 @@ function isExplainRow(r: DecisionRow): r is ExplainDecisionRow {
 }
 
 function statusRank(status: ProductionStatus): number {
-  // Higher = more urgent
   switch (status) {
     case "incident":
       return 4;
@@ -77,7 +70,6 @@ function safeNum(n: unknown, fallback = 0): number {
 }
 
 function deriveSeverityLabel(score: number): SeverityLabel {
-  // Fallback-only heuristic (UI must always have a label even if explain view absent)
   if (score >= 200) return "High";
   if (score >= 80) return "Medium";
   if (score > 0) return "Low";
@@ -151,6 +143,13 @@ function confidencePill(label: ConfidenceLabel) {
   }
 }
 
+function syncedPill(isSynced: boolean | null) {
+  if (isSynced == null) return pillClass("bg-slate-50 text-slate-600 ring-slate-200");
+  return isSynced
+    ? pillClass("bg-emerald-50 text-emerald-700 ring-emerald-200")
+    : pillClass("bg-amber-50 text-amber-700 ring-amber-200");
+}
+
 async function trySelect<T>(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   supabase: any,
@@ -161,7 +160,7 @@ async function trySelect<T>(
     limit?: number;
     eq?: { column: string; value: string | number | boolean };
   }
-): Promise<{ data: T[]; ok: boolean }> {
+): Promise<{ data: T[]; ok: boolean; errorHint?: string }> {
   try {
     let q = supabase.from(tableOrView).select(select);
 
@@ -175,18 +174,17 @@ async function trySelect<T>(
     if (opts?.limit != null) q = q.limit(opts.limit);
 
     const { data, error } = await q;
-    if (error || !data) return { data: [], ok: false };
+    if (error || !data) return { data: [], ok: false, errorHint: error?.message ?? "query_failed" };
     return { data: data as T[], ok: true };
   } catch {
-    return { data: [], ok: false };
+    return { data: [], ok: false, errorHint: "exception" };
   }
 }
 
 async function fetchDecisionRows(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   supabase: any
-): Promise<{ rows: DecisionRow[]; usingExplain: boolean }> {
-  // Try explain view first
+): Promise<{ rows: DecisionRow[]; usingExplain: boolean; sourceName: string; accessHint: string }> {
   const explain = await trySelect<ExplainDecisionRow>(
     supabase,
     "v_production_decisions_explain",
@@ -208,10 +206,9 @@ async function fetchDecisionRows(
   );
 
   if (explain.ok && explain.data.length > 0) {
-    return { rows: explain.data, usingExplain: true };
+    return { rows: explain.data, usingExplain: true, sourceName: "v_production_decisions_explain", accessHint: "ok" };
   }
 
-  // Fallback to base view
   const base = await trySelect<BaseDecisionRow>(
     supabase,
     "v_production_decisions",
@@ -228,83 +225,107 @@ async function fetchDecisionRows(
     `
   );
 
-  return { rows: base.data, usingExplain: false };
+  const hint =
+    explain.ok || base.ok ? "no_rows" : `blocked_or_missing:${explain.errorHint ?? base.errorHint ?? "unknown"}`;
+
+  return { rows: base.data, usingExplain: false, sourceName: "v_production_decisions", accessHint: hint };
 }
 
 async function fetchActiveLogicVersion(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   supabase: any
-): Promise<string | null> {
-  // Preferred: v_ms_active_logic_version
-  const view = await trySelect<{ logic_version_id: string }>(
+): Promise<{ id: string | null; description: string | null; source: string }> {
+  const v1 = await trySelect<{ logic_version_id: string; description?: string | null }>(
     supabase,
     "v_ms_active_logic_version",
-    "logic_version_id",
+    "logic_version_id, description",
     { limit: 1 }
   );
-  if (view.ok && view.data[0]?.logic_version_id) return view.data[0].logic_version_id;
+  if (v1.ok && v1.data[0]?.logic_version_id) {
+    return {
+      id: v1.data[0].logic_version_id ?? null,
+      description: (v1.data[0] as any).description ?? null,
+      source: "v_ms_active_logic_version",
+    };
+  }
 
-  // Fallback: ms_decision_logic_version where is_active=true
-  const tbl = await trySelect<{ id: string }>(
+  const v2 = await trySelect<{ decision_version_id: string; decision_version_description?: string | null }>(
+    supabase,
+    "v_active_decision_logic_version",
+    "decision_version_id, decision_version_description",
+    { limit: 1 }
+  );
+  if (v2.ok && v2.data[0]?.decision_version_id) {
+    return {
+      id: v2.data[0].decision_version_id ?? null,
+      description: (v2.data[0] as any).decision_version_description ?? null,
+      source: "v_active_decision_logic_version",
+    };
+  }
+
+  const t = await trySelect<{ id: string; description?: string | null }>(
     supabase,
     "ms_decision_logic_version",
-    "id",
+    "id, description",
     { eq: { column: "is_active", value: true }, limit: 1 }
   );
-  if (tbl.ok && tbl.data[0]?.id) return tbl.data[0].id;
+  if (t.ok && t.data[0]?.id) {
+    return {
+      id: t.data[0].id ?? null,
+      description: (t.data[0] as any).description ?? null,
+      source: "ms_decision_logic_version",
+    };
+  }
 
-  return null;
+  return { id: null, description: null, source: "unknown" };
 }
 
 async function fetchLatestSnapshotLogicVersion(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   supabase: any
-): Promise<{ logicVersionId: string | null; snapshotAt: string | null }> {
-  // We don’t know which timestamp column exists, so we try best-effort:
-  // 1) order by created_at
-  // 2) order by inserted_at
-  // 3) no order (limit 1)
-  const first = await trySelect<{ logic_version_id: string; created_at?: string | null }>(
+): Promise<{ logicVersionId: string | null; snapshotAt: string | null; source: string }> {
+  const a = await trySelect<{ logic_version_id: string; created_at?: string | null }>(
     supabase,
     "ms_deploy_snapshot",
     "logic_version_id, created_at",
     { order: { column: "created_at", ascending: false }, limit: 1 }
   );
-  if (first.ok && first.data[0]?.logic_version_id) {
+  if (a.ok && a.data[0]?.logic_version_id) {
     return {
-      logicVersionId: first.data[0].logic_version_id ?? null,
-      snapshotAt: (first.data[0] as any).created_at ?? null,
+      logicVersionId: a.data[0].logic_version_id ?? null,
+      snapshotAt: (a.data[0] as any).created_at ?? null,
+      source: "ms_deploy_snapshot.created_at",
     };
   }
 
-  const second = await trySelect<{ logic_version_id: string; inserted_at?: string | null }>(
+  const b = await trySelect<{ logic_version_id: string; inserted_at?: string | null }>(
     supabase,
     "ms_deploy_snapshot",
     "logic_version_id, inserted_at",
     { order: { column: "inserted_at", ascending: false }, limit: 1 }
   );
-  if (second.ok && second.data[0]?.logic_version_id) {
+  if (b.ok && b.data[0]?.logic_version_id) {
     return {
-      logicVersionId: second.data[0].logic_version_id ?? null,
-      snapshotAt: (second.data[0] as any).inserted_at ?? null,
+      logicVersionId: b.data[0].logic_version_id ?? null,
+      snapshotAt: (b.data[0] as any).inserted_at ?? null,
+      source: "ms_deploy_snapshot.inserted_at",
     };
   }
 
-  const third = await trySelect<{ logic_version_id: string }>(
+  const c = await trySelect<{ logic_version_id: string }>(
     supabase,
     "ms_deploy_snapshot",
     "logic_version_id",
     { limit: 1 }
   );
-  if (third.ok && third.data[0]?.logic_version_id) {
-    return { logicVersionId: third.data[0].logic_version_id ?? null, snapshotAt: null };
+  if (c.ok && c.data[0]?.logic_version_id) {
+    return { logicVersionId: c.data[0].logic_version_id ?? null, snapshotAt: null, source: "ms_deploy_snapshot" };
   }
 
-  return { logicVersionId: null, snapshotAt: null };
+  return { logicVersionId: null, snapshotAt: null, source: "unknown" };
 }
 
 function sortRows(rows: DecisionRow[]): DecisionRow[] {
-  // Deterministic: status desc, severity desc, 24h desc, 7d desc, recency asc, signal_id asc
   return [...rows].sort((a, b) => {
     const sr = statusRank(b.production_status) - statusRank(a.production_status);
     if (sr !== 0) return sr;
@@ -326,20 +347,34 @@ function sortRows(rows: DecisionRow[]): DecisionRow[] {
   });
 }
 
-function shortId(id: string | null): string {
-  if (!id) return "unknown";
-  // Keep readable but stable
-  return id.length > 12 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+// ----------------------------------------------------------------------------
+// Demo mode
+// ----------------------------------------------------------------------------
+function demoRow(): ExplainDecisionRow {
+  return {
+    signal_id: "demo-signal-00000000-0000-0000-0000-000000000000",
+    prod_issues_24h: 2,
+    prod_issues_7d: 9,
+    last_prod_issue_at: null,
+    minutes_since_last_prod_issue: 25,
+    severity_score_7d: 245,
+    production_status: "incident",
+    suggested_action_code: "page_oncall",
+    suggested_action_text: "Page on-call. Start incident response. Confirm impact and scope.",
+    trend_24h_vs_7d: "worsening",
+    confidence: "high",
+    severity_label: "High",
+    status_reason_code: "DEMO_ROW_NO_AUTH",
+  };
 }
 
 function ProductionDecisionCard({ row, usingExplain }: { row: DecisionRow; usingExplain: boolean }) {
   const score = safeNum(row.severity_score_7d);
   const explain = isExplainRow(row) ? row : null;
-  const severityLabel: SeverityLabel =
-    explain?.severity_label ?? deriveSeverityLabel(score);
+  const severityLabel: SeverityLabel = explain?.severity_label ?? deriveSeverityLabel(score);
 
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+    <div className="rounded-2xl border border-neutral-800 bg-neutral-900 p-4 shadow-sm">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
@@ -355,49 +390,45 @@ function ProductionDecisionCard({ row, usingExplain }: { row: DecisionRow; using
             ) : null}
           </div>
 
-          <div className="mt-2 text-sm text-slate-600">
-            <span className="font-mono text-slate-800">{row.signal_id}</span>
+          <div className="mt-2 text-sm text-neutral-300">
+            <span className="font-mono text-neutral-200">{row.signal_id}</span>
           </div>
         </div>
 
-        <div className="text-right text-sm text-slate-600">
+        <div className="text-right text-sm text-neutral-300">
           <div>
-            <span className="font-medium text-slate-800">{safeNum(row.prod_issues_24h)}</span> /24h
+            <span className="font-medium text-neutral-100">{safeNum(row.prod_issues_24h)}</span> /24h
           </div>
           <div>
-            <span className="font-medium text-slate-800">{safeNum(row.prod_issues_7d)}</span> /7d
+            <span className="font-medium text-neutral-100">{safeNum(row.prod_issues_7d)}</span> /7d
           </div>
         </div>
       </div>
 
       <div className="mt-3 grid grid-cols-2 gap-3 text-sm">
-        <div className="rounded-xl bg-slate-50 p-3">
-          <div className="text-slate-500">Severity score (7d)</div>
-          <div className="mt-1 text-lg font-semibold text-slate-900">{score}</div>
+        <div className="rounded-xl bg-neutral-800 p-3">
+          <div className="text-neutral-400">Severity score (7d)</div>
+          <div className="mt-1 text-lg font-semibold text-neutral-100">{score}</div>
         </div>
-        <div className="rounded-xl bg-slate-50 p-3">
-          <div className="text-slate-500">Last prod issue</div>
-          <div className="mt-1 font-semibold text-slate-900">
-            {formatAgoMinutes(row.minutes_since_last_prod_issue)}
-          </div>
+        <div className="rounded-xl bg-neutral-800 p-3">
+          <div className="text-neutral-400">Last prod issue</div>
+          <div className="mt-1 font-semibold text-neutral-100">{formatAgoMinutes(row.minutes_since_last_prod_issue)}</div>
         </div>
       </div>
 
-      <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
-        <div className="text-xs text-slate-500">Suggested action</div>
-        <div className="mt-1 text-sm font-medium text-slate-900">
-          {row.suggested_action_text ?? "—"}
-        </div>
+      <div className="mt-3 rounded-xl border border-neutral-800 bg-neutral-950/30 p-3">
+        <div className="text-xs text-neutral-400">Suggested action</div>
+        <div className="mt-1 text-sm font-medium text-neutral-100">{row.suggested_action_text ?? "—"}</div>
         {row.suggested_action_code ? (
-          <div className="mt-1 text-xs text-slate-500">
-            code: <span className="font-mono">{row.suggested_action_code}</span>
+          <div className="mt-1 text-xs text-neutral-400">
+            code: <span className="font-mono text-neutral-200">{row.suggested_action_code}</span>
           </div>
         ) : null}
       </div>
 
       {usingExplain && explain?.status_reason_code ? (
-        <div className="mt-3 text-xs text-slate-500">
-          reason: <span className="font-mono">{explain.status_reason_code}</span>
+        <div className="mt-3 text-xs text-neutral-400">
+          reason: <span className="font-mono text-neutral-200">{explain.status_reason_code}</span>
         </div>
       ) : null}
     </div>
@@ -407,58 +438,88 @@ function ProductionDecisionCard({ row, usingExplain }: { row: DecisionRow; using
 export default async function DecisionsPage() {
   const supabase = await createSupabaseServerClient();
 
-  // Fetch decisions (best-effort)
-  const { rows: rawRows, usingExplain } = await fetchDecisionRows(supabase);
+  const { rows: rawRows, usingExplain, sourceName, accessHint } = await fetchDecisionRows(supabase);
   const rows = sortRows(rawRows);
 
-  // Fetch decision version info (best-effort)
-  const activeLogicVersionId = await fetchActiveLogicVersion(supabase);
-  const latestSnapshot = await fetchLatestSnapshotLogicVersion(supabase);
+  const active = await fetchActiveLogicVersion(supabase);
+  const snap = await fetchLatestSnapshotLogicVersion(supabase);
+  const isSynced = active.id && snap.logicVersionId ? active.id === snap.logicVersionId : null;
+
+  const showDemo = rows.length === 0;
+  const finalRows = showDemo ? [demoRow()] : rows;
+
+  const authBanner = showDemo
+    ? {
+        title: "Live data requires authentication",
+        body:
+          "You’re seeing a demo card because the DB views are RLS-protected (auth.uid()). This is expected until we wire the ecosystem auth later.",
+        meta: `hint: ${accessHint}`,
+      }
+    : null;
 
   return (
-    <div className="mx-auto w-full max-w-6xl px-4 py-8">
+    <div className="mx-auto w-full max-w-6xl px-4 py-8 text-neutral-100">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-            Production Decisions
-          </h1>
+          <h1 className="text-2xl font-semibold tracking-tight text-neutral-100">Production Decisions</h1>
 
-          <div className="mt-1 text-sm text-slate-600">
-            Decision logic:{" "}
-            <span className="font-medium text-slate-900">
-              Active {shortId(activeLogicVersionId)}
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-sm text-neutral-300">
+            <span className="text-neutral-400">Decision logic:</span>
+
+            <span className="inline-flex items-center" title={active.description ?? undefined}>
+              <TooltipId label="Active" id={active.id} />
             </span>
-            {" · "}
-            <span className="font-medium text-slate-900">
-              Snapshot {shortId(latestSnapshot.logicVersionId)}
+
+            <span className="text-neutral-500">·</span>
+
+            <span className="inline-flex items-center gap-2">
+              <TooltipId label="Snapshot" id={snap.logicVersionId} />
+              {snap.snapshotAt ? (
+                <span className="text-xs text-neutral-400" title={snap.snapshotAt}>
+                  ({snap.snapshotAt})
+                </span>
+              ) : null}
             </span>
-            {latestSnapshot.snapshotAt ? (
-              <span className="text-slate-500"> (at {latestSnapshot.snapshotAt})</span>
-            ) : null}
+
+            <span className={syncedPill(isSynced)}>{isSynced == null ? "unknown" : isSynced ? "synced" : "drift"}</span>
           </div>
 
-          <div className="mt-1 text-xs text-slate-500">
-            Data source: {usingExplain ? "v_production_decisions_explain" : "v_production_decisions"}{" "}
-            (best-effort fallback)
+          <div className="mt-1 text-xs text-neutral-400">
+            Active source: <span className="font-mono text-neutral-200">{active.source}</span> · Snapshot source:{" "}
+            <span className="font-mono text-neutral-200">{snap.source}</span>
+          </div>
+
+          <div className="mt-1 text-xs text-neutral-400">
+            Data source: <span className="font-mono text-neutral-200">{sourceName}</span>
           </div>
         </div>
 
-        <div className="text-xs text-slate-500">
-          Rows: <span className="font-medium text-slate-700">{rows.length}</span>
+        <div className="text-xs text-neutral-400">
+          Rows: <span className="font-medium text-neutral-200">{finalRows.length}</span>
+          {showDemo ? (
+            <span className="ml-2 rounded-full bg-neutral-800 px-2 py-0.5 text-[11px] text-neutral-200 ring-1 ring-neutral-700">
+              demo
+            </span>
+          ) : null}
         </div>
       </div>
 
-      <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
-        {rows.length === 0 ? (
-          <div className="rounded-2xl border border-slate-200 bg-white p-6 text-sm text-slate-600">
-            No decision rows returned. (If this is unexpected, verify RLS/auth cookies and that the views
-            exist in the current schema.)
+      {authBanner ? (
+        <div className="mt-4 rounded-2xl border border-amber-300/30 bg-amber-200/10 p-4 text-sm text-amber-100">
+          <div className="font-semibold">{authBanner.title}</div>
+          <div className="mt-1 text-amber-100/90">{authBanner.body}</div>
+          <div className="mt-2 text-xs text-amber-100/80">
+            <span className="font-mono">{authBanner.meta}</span>
           </div>
-        ) : (
-          rows.map((r) => (
-            <ProductionDecisionCard key={r.signal_id} row={r} usingExplain={usingExplain} />
-          ))
-        )}
+        </div>
+      ) : null}
+
+      <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
+        {finalRows.map((r) => (
+          <DecisionCardLink key={r.signal_id} href={`/decisions/${r.signal_id}`}>
+            <ProductionDecisionCard row={r} usingExplain={usingExplain || showDemo} />
+          </DecisionCardLink>
+        ))}
       </div>
     </div>
   );
