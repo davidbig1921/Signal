@@ -1,0 +1,2 @@
+-- Applied on remote.
+-- v_my_entitlement locking logic already enforced.
